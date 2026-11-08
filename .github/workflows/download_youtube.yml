@@ -26,8 +26,7 @@ jobs:
       - name: Initialize environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ffmpeg bc curl wget ca-certificates
+          sudo apt-get install -y --no-install-recommends ffmpeg bc curl wget ca-certificates
           pip install --no-cache-dir yt-dlp
 
       # ────────────────────────────────────────────────
@@ -35,46 +34,28 @@ jobs:
       # ────────────────────────────────────────────────
       - name: Install Node.js
         run: |
-          echo "=============================================="
-          echo "  Installing Node.js"
-          echo "=============================================="
           curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
           sudo apt-get install -y nodejs
           node -v
           npm -v
 
       # ────────────────────────────────────────────────
-      # 3. Puppeteerをローカルにインストール（修正版）
+      # 3. Puppeteerをローカルにインストール
       # ────────────────────────────────────────────────
-      - name: Install Puppeteer locally
+      - name: Install Puppeteer
         run: |
-          echo "=============================================="
-          echo "  Installing Puppeteer"
-          echo "=============================================="
-
-          # 専用ディレクトリを作成
           mkdir -p /tmp/puppeteer-project
           cd /tmp/puppeteer-project
-
-          # package.jsonを初期化
           npm init -y
-
-          # Puppeteerの最新安定版をインストール
-          npm install puppeteer@latest
-
-          # インストールパスを環境変数に設定
+          npm install puppeteer@24.15.0  # 最新の安定版を明示的に指定
           echo "PUP_PATH=/tmp/puppeteer-project/node_modules" >> $GITHUB_ENV
 
-          # 元のワークスペースに戻る（自動的に戻る）
-          echo "Puppeteer installed successfully"
-
       # ────────────────────────────────────────────────
-      # 4. Cookie取得スクリプトを作成
+      # 4. Cookie取得スクリプトを作成（修正版）
       # ────────────────────────────────────────────────
       - name: Create cookie generation script
         run: |
           cat > /tmp/generate_youtube_cookies.js << 'ENDOFSCRIPT'
-          // Puppeteerを絶対パスで読み込み
           const puppeteer = require('/tmp/puppeteer-project/node_modules/puppeteer');
           const fs = require('fs');
 
@@ -102,13 +83,16 @@ jobs:
 
               console.log('🌐 Accessing YouTube...');
               await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36');
+
+              // 修正: waitForTimeout → waitForFunction
               await page.goto('https://www.youtube.com', {
                 waitUntil: 'networkidle2',
                 timeout: 60000
               });
 
               console.log('⏳ Waiting for page to load...');
-              await page.waitForTimeout(5000);
+              // 修正: waitForTimeoutの代わりにsetTimeoutを使用
+              await new Promise(resolve => setTimeout(resolve, 5000));
 
               console.log('🍪 Extracting cookies...');
               const cookies = await page.cookies();
@@ -167,7 +151,6 @@ jobs:
               echo "COOKIE_FILE=/tmp/youtube_cookies.txt" >> $GITHUB_OUTPUT
               echo "COOKIE_SOURCE=generated" >> $GITHUB_OUTPUT
             else
-              echo "❌ Cookie generation failed"
               echo "COOKIE_FILE=" >> $GITHUB_OUTPUT
               echo "COOKIE_SOURCE=none" >> $GITHUB_OUTPUT
             fi
@@ -316,6 +299,14 @@ jobs:
           files: ${{ steps.download.outputs.file_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install GitHub CLI
+        if: steps.split.outputs.needs_split == 'true'
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
 
       - name: Upload segments
         if: steps.split.outputs.needs_split == 'true'
