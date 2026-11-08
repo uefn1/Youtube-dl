@@ -24,13 +24,9 @@ jobs:
       # ────────────────────────────────────────
       - name: Clean up environment
         run: |
-          # 不要なパッケージを削除してディスク容量を確保
           sudo apt-get autoremove -y
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
-          sudo rm -rf /usr/share/doc/*
-          sudo rm -rf /usr/share/man/*
-          sudo rm -rf /usr/share/locale/*
           df -h
 
       # ────────────────────────────────────────
@@ -39,80 +35,69 @@ jobs:
       - name: Install minimal dependencies
         run: |
           sudo apt-get update
-          # 必要最小限のパッケージのみ
           sudo apt-get install -y --no-install-recommends \
             ffmpeg \
             bc \
             nodejs \
-            ca-certificates \
-            curl \
-            wget
+            ca-certificates
           pip install --no-cache-dir yt-dlp
 
       # ────────────────────────────────────────
-      # 3. Cookie取得環境を構築
+      # 3. Cookie取得スクリプトを作成
       # ────────────────────────────────────────
-      - name: Setup cookie environment
+      - name: Create cookie generation script
         run: |
-          # Node.jsを最新化
-          sudo npm install -g n
-          sudo n latest
+          cat > /tmp/generate_cookies.js << 'ENDOFFILE'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
 
-          # Puppeteer (Headless Chrome) をインストール
+          (async () => {
+            try {
+              const browser = await puppeteer.launch({
+                headless: true,
+                args: ['--no-sandbox', '--disable-setuid-sandbox']
+              });
+              const page = await browser.newPage();
+
+              await page.goto('https://www.youtube.com', {
+                waitUntil: 'networkidle2',
+                timeout: 30000
+              });
+
+              const cookies = await page.cookies();
+              let cookieText = '# YouTube cookies for yt-dlp\n';
+              cookies.forEach(cookie => {
+                if (cookie.domain.includes('youtube.com')) {
+                  cookieText += `${cookie.domain}\t${cookie.secure ? 'TRUE' : 'FALSE'}\t${cookie.path}\t${cookie.expires ? 'TRUE' : 'FALSE'}\t${cookie.expires || 0}\t${cookie.name}\t${cookie.value}\n`;
+                }
+              });
+
+              fs.writeFileSync('/tmp/youtube_cookies.txt', cookieText);
+              console.log('✅ Cookies generated successfully');
+              await browser.close();
+            } catch (error) {
+              console.error('❌ Failed to generate cookies:', error);
+              process.exit(1);
+            }
+          })();
+          ENDOFFILE
+
+      # ────────────────────────────────────────
+      # 4. Puppeteerをインストール
+      # ────────────────────────────────────────
+      - name: Install Puppeteer
+        run: |
           sudo npm install -g puppeteer
 
-          # Cookieディレクトリを作成
-          mkdir -p ~/.yt-dlp-cookies
-
       # ────────────────────────────────────────
-      # 4. YouTube Cookieを自動取得 (オプション)
+      # 5. Cookieを自動取得 (Secretsがなければ)
       # ────────────────────────────────────────
-      - name: Auto-generate cookie file (if not using secrets)
+      - name: Generate cookies if not using secrets
         id: generate_cookies
         run: |
-          # SecretsにCookieが設定されていない場合に自動生成を試みる
           if [ -z "${{ secrets.YOUTUBE_COOKIES }}" ]; then
             echo "No YOUTUBE_COOKIES secret found, attempting auto-generation..."
-
-            # Puppeteerを使ってYouTubeにアクセスしCookieを取得
-            node - <<'EOF'
-            const puppeteer = require('puppeteer');
-            const fs = require('fs');
-
-            (async () => {
-              try {
-                const browser = await puppeteer.launch({
-                  headless: true,
-                  args: ['--no-sandbox', '--disable-setuid-sandbox']
-                });
-                const page = await browser.newPage();
-
-                // YouTubeにアクセス
-                await page.goto('https://www.youtube.com', {
-                  waitUntil: 'networkidle2',
-                  timeout: 30000
-                });
-
-                // Cookieを取得
-                const cookies = await page.cookies();
-
-                // Netscape cookie formatで保存
-                let cookieText = '# YouTube cookies for yt-dlp\n';
-                cookies.forEach(cookie => {
-                  if (cookie.domain.includes('youtube.com')) {
-                    cookieText += `${cookie.domain}\t${cookie.secure ? 'TRUE' : 'FALSE'}\t${cookie.path}\t${cookie.expires ? 'TRUE' : 'FALSE'}\t${cookie.expires || 0}\t${cookie.name}\t${cookie.value}\n`;
-                  }
-                });
-
-                fs.writeFileSync('/tmp/youtube_cookies.txt', cookieText);
-                console.log('Cookies generated successfully');
-              } catch (error) {
-                console.error('Failed to generate cookies:', error);
-                process.exit(1);
-              }
-            })();
-            EOF
-
+            node /tmp/generate_cookies.js
             if [ -f /tmp/youtube_cookies.txt ]; then
               echo "COOKIE_FILE=/tmp/youtube_cookies.txt" >> $GITHUB_OUTPUT
               echo "Using auto-generated cookies"
@@ -126,7 +111,7 @@ jobs:
           fi
 
       # ────────────────────────────────────────
-      # 5. YouTube動画ダウンロード (最高品質)
+      # 6. YouTube動画ダウンロード (最高品質)
       # ────────────────────────────────────────
       - name: Download YouTube video (highest quality)
         id: download
@@ -182,7 +167,7 @@ jobs:
           echo "Download complete: ${OUTPUT_FILENAME} (${FILE_SIZE_GB} GB)"
 
       # ────────────────────────────────────────
-      # 6. 1.9 GiB超えればTS分割
+      # 7. 1.9 GiB超えればTS分割
       # ────────────────────────────────────────
       - name: Split into TS segments if > 1.9 GiB
         id: split
@@ -191,7 +176,6 @@ jobs:
           FILE_SIZE="${{ steps.download.outputs.file_size }}"
           VIDEO_ID="${{ steps.download.outputs.video_id }}"
 
-          # 1.9 GiB in bytes = 2037108121
           MAX_SIZE=2037108121
           TARGET_SEGMENT_BYTES=1828915200
 
@@ -269,7 +253,7 @@ jobs:
           fi
 
       # ────────────────────────────────────────
-      # 7. Release作成とアップロード
+      # 8. Release作成とアップロード
       # ────────────────────────────────────────
       - name: Create GitHub Release
         id: create_release
@@ -324,7 +308,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ────────────────────────────────────────
-      # 8. クリーンアップ
+      # 9. クリーンアップ
       # ────────────────────────────────────────
       - name: Cleanup
         if: always()
@@ -332,6 +316,6 @@ jobs:
           echo "Cleaning up temporary files..."
           rm -f ${{ steps.download.outputs.file_path }}
           rm -rf ${{ steps.split.outputs.segment_dir }}
-          rm -f /tmp/cookies.txt /tmp/youtube_cookies.txt
+          rm -f /tmp/cookies.txt /tmp/youtube_cookies.txt /tmp/generate_cookies.js
           sudo apt-get autoremove -y
           sudo apt-get clean
