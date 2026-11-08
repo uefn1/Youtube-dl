@@ -207,44 +207,44 @@ jobs:
           echo "YouTube cookies: $YOUTUBE_COUNT"
           echo "Google cookies: $GOOGLE_COUNT"
 
-          if [ "$YOUTUBE_COUNT" -eq 0 ] && [ "$GOOGLE_COUNT" -eq 0 ]; then
+          if [ "$YOUTUBE_COUNT" -eq 0 ]; then
             echo ""
-            echo "❌ ERROR: No YouTube or Google cookies found!"
+            echo "❌ ERROR: No YouTube cookies found!"
             echo ""
             echo "Cookie file content:"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            head -20 "$COOKIE_FILE"
+            cat "$COOKIE_FILE"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             exit 1
           fi
 
-          # 5. 最低限の形式チェック（タブ区切り）
+          # 5. 形式をチェック（最低限のタブ数）
           VALID_LINES=0
-          while IFS= read -r line; do
+          while IFS= read -r line || [ -n "$line" ]; do
             # 空行とコメント行をスキップ
             [[ -z "$line" || "$line" == \#* ]] && continue
 
             # タブの数をカウント
             TAB_COUNT=$(echo "$line" | tr -cd '\t' | wc -c)
 
-            # 7つ以上のタブ（8つ以上のフィールド）があるか
-            if [ "$TAB_COUNT" -ge 7 ]; then
+            # 6タブ以上（7フィールド以上）があるか
+            if [ "$TAB_COUNT" -ge 6 ]; then
               ((VALID_LINES++))
+            else
+              echo "⚠️  Line with $TAB_COUNT tabs (needs >=6): $line"
             fi
           done < "$COOKIE_FILE"
 
           echo "Valid cookie entries: $VALID_LINES"
 
-          if [ "$VALID_LINES" -eq 0 ]; then
+          if [ "$VALID_LINES" -lt "$YOUTUBE_COUNT" ]; then
             echo ""
-            echo "❌ ERROR: No valid cookie entries found!"
-            echo ""
-            echo "Each line must have at least 7 tab-separated fields."
+            echo "❌ ERROR: Some YouTube cookies have invalid format!"
             echo ""
             echo "Cookie file content:"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            head -20 "$COOKIE_FILE"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            cat "$COOKIE_FILE"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             exit 1
           fi
 
