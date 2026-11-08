@@ -19,12 +19,115 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # ────────────────────────────────────────
+      # 1. 環境クリーンアップ
+      # ────────────────────────────────────────
+      - name: Clean up environment
+        run: |
+          # 不要なパッケージを削除してディスク容量を確保
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo rm -rf /usr/share/doc/*
+          sudo rm -rf /usr/share/man/*
+          sudo rm -rf /usr/share/locale/*
+          df -h
+
+      # ────────────────────────────────────────
+      # 2. 最小限の依存関係のみインストール
+      # ────────────────────────────────────────
+      - name: Install minimal dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg bc
-          pip install yt-dlp
+          # 必要最小限のパッケージのみ
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            bc \
+            nodejs \
+            ca-certificates \
+            curl \
+            wget
+          pip install --no-cache-dir yt-dlp
 
+      # ────────────────────────────────────────
+      # 3. Cookie取得環境を構築
+      # ────────────────────────────────────────
+      - name: Setup cookie environment
+        run: |
+          # Node.jsを最新化
+          sudo npm install -g n
+          sudo n latest
+
+          # Puppeteer (Headless Chrome) をインストール
+          sudo npm install -g puppeteer
+
+          # Cookieディレクトリを作成
+          mkdir -p ~/.yt-dlp-cookies
+
+      # ────────────────────────────────────────
+      # 4. YouTube Cookieを自動取得 (オプション)
+      # ────────────────────────────────────────
+      - name: Auto-generate cookie file (if not using secrets)
+        id: generate_cookies
+        run: |
+          # SecretsにCookieが設定されていない場合に自動生成を試みる
+          if [ -z "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo "No YOUTUBE_COOKIES secret found, attempting auto-generation..."
+
+            # Puppeteerを使ってYouTubeにアクセスしCookieを取得
+            node - <<'EOF'
+            const puppeteer = require('puppeteer');
+            const fs = require('fs');
+
+            (async () => {
+              try {
+                const browser = await puppeteer.launch({
+                  headless: true,
+                  args: ['--no-sandbox', '--disable-setuid-sandbox']
+                });
+                const page = await browser.newPage();
+
+                // YouTubeにアクセス
+                await page.goto('https://www.youtube.com', {
+                  waitUntil: 'networkidle2',
+                  timeout: 30000
+                });
+
+                // Cookieを取得
+                const cookies = await page.cookies();
+
+                // Netscape cookie formatで保存
+                let cookieText = '# YouTube cookies for yt-dlp\n';
+                cookies.forEach(cookie => {
+                  if (cookie.domain.includes('youtube.com')) {
+                    cookieText += `${cookie.domain}\t${cookie.secure ? 'TRUE' : 'FALSE'}\t${cookie.path}\t${cookie.expires ? 'TRUE' : 'FALSE'}\t${cookie.expires || 0}\t${cookie.name}\t${cookie.value}\n`;
+                  }
+                });
+
+                fs.writeFileSync('/tmp/youtube_cookies.txt', cookieText);
+                console.log('Cookies generated successfully');
+              } catch (error) {
+                console.error('Failed to generate cookies:', error);
+                process.exit(1);
+              }
+            })();
+            EOF
+
+            if [ -f /tmp/youtube_cookies.txt ]; then
+              echo "COOKIE_FILE=/tmp/youtube_cookies.txt" >> $GITHUB_OUTPUT
+              echo "Using auto-generated cookies"
+            else
+              echo "COOKIE_FILE=" >> $GITHUB_OUTPUT
+              echo "No cookies available"
+            fi
+          else
+            echo "COOKIE_FILE=" >> $GITHUB_OUTPUT
+            echo "Using YOUTUBE_COOKIES secret"
+          fi
+
+      # ────────────────────────────────────────
+      # 5. YouTube動画ダウンロード (最高品質)
+      # ────────────────────────────────────────
       - name: Download YouTube video (highest quality)
         id: download
         run: |
@@ -39,6 +142,18 @@ jobs:
           OUTPUT_FILENAME="youtube_${VIDEO_ID}.mp4"
 
           echo "Downloading with yt-dlp (highest quality)..."
+
+          # Cookieの優先順位: Secrets > 自動生成 > なし
+          COOKIE_OPTIONS=""
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo "Using YOUTUBE_COOKIES secret"
+            echo "${{ secrets.YOUTUBE_COOKIES }}" > /tmp/cookies.txt
+            COOKIE_OPTIONS="--cookies /tmp/cookies.txt"
+          elif [ -n "${{ steps.generate_cookies.outputs.COOKIE_FILE }}" ]; then
+            echo "Using auto-generated cookies"
+            COOKIE_OPTIONS="--cookies ${{ steps.generate_cookies.outputs.COOKIE_FILE }}"
+          fi
+
           yt-dlp \
             --no-check-certificate \
             --format "bestvideo+bestaudio/best" \
@@ -47,6 +162,8 @@ jobs:
             --retries 10 \
             --fragment-retries 10 \
             --socket-timeout 60 \
+            --js-runtimes node \
+            $COOKIE_OPTIONS \
             "$URL"
 
           if [ ! -f "$OUTPUT_FILENAME" ]; then
@@ -64,6 +181,9 @@ jobs:
 
           echo "Download complete: ${OUTPUT_FILENAME} (${FILE_SIZE_GB} GB)"
 
+      # ────────────────────────────────────────
+      # 6. 1.9 GiB超えればTS分割
+      # ────────────────────────────────────────
       - name: Split into TS segments if > 1.9 GiB
         id: split
         run: |
@@ -73,21 +193,15 @@ jobs:
 
           # 1.9 GiB in bytes = 2037108121
           MAX_SIZE=2037108121
-
-          # Target segment size: 1.7 GiB (1828915200 bytes) to stay safely under GitHub's 2GB limit
           TARGET_SEGMENT_BYTES=1828915200
 
           echo "File size: ${FILE_SIZE} bytes"
-          echo "Max size (1.9 GiB): ${MAX_SIZE} bytes"
 
           if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
             echo "File exceeds 1.9 GiB, splitting into TS segments..."
-
-            # Create output directory for segments
             OUTPUT_DIR="segments_${VIDEO_ID}"
             mkdir -p "$OUTPUT_DIR"
 
-            # Use ffmpeg with segment_size for byte-based splitting
             ffmpeg -y -i "$FILE_PATH" \
               -c copy \
               -f segment \
@@ -101,7 +215,6 @@ jobs:
               -reset_timestamps 1 \
               "${OUTPUT_DIR}/segment_%03d.ts"
 
-            # Verify segments were created
             SEGMENT_COUNT=$(ls -1 "${OUTPUT_DIR}"/*.ts 2>/dev/null | wc -l)
             if [ "$SEGMENT_COUNT" -eq 0 ]; then
               echo "Error: No segments were created"
@@ -111,13 +224,10 @@ jobs:
             echo "Segments created:"
             ls -lh "${OUTPUT_DIR}"/*.ts
 
-            # Check if any segment exceeds 1.9 GiB
             LARGE_SEGMENTS=$(find "${OUTPUT_DIR}" -name "*.ts" -size +${MAX_SIZE}c)
             if [ -n "$LARGE_SEGMENTS" ]; then
-              echo "Warning: Some segments exceed 1.9 GiB, re-splitting with smaller size..."
+              echo "Warning: Some segments exceed 1.9 GiB, re-splitting..."
               rm -f "${OUTPUT_DIR}"/*.ts
-
-              # Reduce target size to 1.5 GiB (1610612736 bytes)
               NEW_TARGET=1610612736
 
               ffmpeg -y -i "$FILE_PATH" \
@@ -133,23 +243,17 @@ jobs:
                 -reset_timestamps 1 \
                 "${OUTPUT_DIR}/segment_%03d.ts"
 
-              # Verify again
               SEGMENT_COUNT=$(ls -1 "${OUTPUT_DIR}"/*.ts 2>/dev/null | wc -l)
               if [ "$SEGMENT_COUNT" -eq 0 ]; then
                 echo "Error: Failed to create valid segments"
                 exit 1
               fi
 
-              # Final check - if still too large, fail
               LARGE_SEGMENTS=$(find "${OUTPUT_DIR}" -name "*.ts" -size +${MAX_SIZE}c)
               if [ -n "$LARGE_SEGMENTS" ]; then
                 echo "Error: Cannot split into segments under 1.9 GiB"
-                echo "Problematic segments:"
-                find "${OUTPUT_DIR}" -name "*.ts" -size +${MAX_SIZE}c -exec ls -lh {} \;
                 exit 1
               fi
-
-              echo "Re-splitting complete: ${SEGMENT_COUNT} segments"
             fi
 
             SEGMENT_COUNT=$(ls -1 "${OUTPUT_DIR}"/*.ts 2>/dev/null | wc -l)
@@ -164,6 +268,9 @@ jobs:
             echo "segment_count=0" >> $GITHUB_OUTPUT
           fi
 
+      # ────────────────────────────────────────
+      # 7. Release作成とアップロード
+      # ────────────────────────────────────────
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v2
@@ -176,8 +283,7 @@ jobs:
             **Source URL:** ${{ inputs.youtube_url }}
             **File Size:** ${{ steps.download.outputs.file_size_gb }} GB
             **Quality:** Highest Available (bestvideo+bestaudio/best)
-
-            ${{ steps.split.outputs.needs_split == 'true' && format('**Segments:** {0} TS files (split at ~1.7 GiB each)', steps.split.outputs.segment_count) || '' }}
+            ${{ steps.split.outputs.needs_split == 'true' && format('**Segments:** {0} TS files', steps.split.outputs.segment_count) || '' }}
           draft: false
           prerelease: false
           fail_on_unmatched_files: false
@@ -205,7 +311,6 @@ jobs:
       - name: Upload segments to release
         if: steps.split.outputs.needs_split == 'true'
         run: |
-          # Upload each segment individually
           for segment in ${{ steps.split.outputs.segment_dir }}/*.ts; do
             SEGMENT_NAME=$(basename "$segment")
             SEGMENT_SIZE=$(stat -c%s "$segment")
@@ -213,16 +318,20 @@ jobs:
             echo "Uploading ${SEGMENT_NAME} (${SEGMENT_SIZE_GB} GB)..."
             gh release upload ${{ inputs.release_tag }} "$segment" --clobber
           done
-
-          # Upload playlist file for HLS playback
           echo "Uploading HLS playlist..."
           gh release upload ${{ inputs.release_tag }} "${{ steps.split.outputs.segment_dir }}/playlist.m3u8" --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ────────────────────────────────────────
+      # 8. クリーンアップ
+      # ────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
           echo "Cleaning up temporary files..."
           rm -f ${{ steps.download.outputs.file_path }}
           rm -rf ${{ steps.split.outputs.segment_dir }}
+          rm -f /tmp/cookies.txt /tmp/youtube_cookies.txt
+          sudo apt-get autoremove -y
+          sudo apt-get clean
