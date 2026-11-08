@@ -46,7 +46,7 @@ jobs:
             --output "${OUTPUT_FILENAME}" \
             --retries 10 \
             --fragment-retries 10 \
-            --timeout 60 \
+            --socket-timeout 60 \
             "$URL"
 
           if [ ! -f "$OUTPUT_FILENAME" ]; then
